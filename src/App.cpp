@@ -446,6 +446,7 @@ bool App::Init() {
             SDL_SetWindowPosition(m_window, wx, wy);
         m_showTimeline = m_layoutSettings.GetBool("show_timeline", true);
         m_showSegments = m_layoutSettings.GetBool("show_segments", false);
+        m_showMinimap = m_layoutSettings.GetBool("show_minimap", true);
     }
 
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -742,6 +743,7 @@ void App::Shutdown() {
         m_layoutSettings.SetBool("window_maximized", m_maximized);
         m_layoutSettings.SetBool("show_timeline", m_showTimeline);
         m_layoutSettings.SetBool("show_segments", m_showSegments);
+        m_layoutSettings.SetBool("show_minimap", m_showMinimap);
         m_layoutSettings.Save();
 
         m_prefSettings.SetBool("show_chapters", m_showChapters);
@@ -842,6 +844,7 @@ void App::OpenFile(const std::string& rawPath) {
     m_displayTexture = nullptr;
     m_videoWidth = 0;
     m_videoHeight = 0;
+    m_crop.Reset();
 
     if (!m_player.Open(path))
         return;
@@ -1121,6 +1124,18 @@ void App::FlashSpeed() {
     ShowStatus(buf);
 }
 
+void App::FlashZoom() {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "Zoom: %.2fx", m_crop.zoom);
+    ShowStatus(buf);
+}
+
+void App::ZoomCrop(float factor) {
+    if (!m_player.HasMedia()) return;
+    m_crop.ZoomBy(factor);
+    FlashZoom();
+}
+
 void App::FlashVolume() {
     char buf[24];
     snprintf(buf, sizeof(buf), "Volume: %d%%",
@@ -1281,6 +1296,100 @@ void App::AddToRecent(const std::string& path) {
         m_recentFiles.resize(kRecentMax);
 }
 
+// Floating "Minimap" window: the whole frame with the current crop highlighted.
+// Dragging inside it pans the crop. Shown only while zoomed in (and enabled in
+// View > Windows). On a Reset Layout frame it is forced through Begin so the
+// default position gets re-applied, same trick as Marks / Help.
+void App::RenderMinimapWindow(ImGuiCond layoutCond, bool wasResetFrame) {
+    PROFILE_SCOPE_N("Minimap panel");
+    const bool canDraw = m_displayTexture && m_player.HasMedia() &&
+                         m_videoWidth > 0 && m_videoHeight > 0;
+    const bool wanted = (m_showMinimap && m_crop.IsZoomed() && canDraw) || wasResetFrame;
+    if (!wanted || m_uiHidden) return;
+
+    const float s = m_ui.GetUiScale();
+    const float aspect = canDraw
+        ? static_cast<float>(m_videoWidth) / static_cast<float>(m_videoHeight)
+        : 16.0f / 9.0f;
+    const float pad = 4.0f * s;
+    const float defW = 280.0f * s;
+    const float defH = (defW - 2.0f * pad) / aspect + 2.0f * pad + ImGui::GetFrameHeight();
+
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowBgAlpha(0.85f * m_uiAlpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, m_uiAlpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + 40.0f * s, vp->WorkPos.y + 40.0f * s), layoutCond);
+    ImGui::SetNextWindowSize(ImVec2(defW, defH), layoutCond);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(120.0f * s, 90.0f * s), ImVec2(FLT_MAX, FLT_MAX));
+    ImGui::Begin("Minimap", &m_showMinimap,
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                 ImGuiWindowFlags_NoFocusOnAppearing);
+
+    if (canDraw) {
+        // Letterbox the frame into the window's content area, like the Viewport does.
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        float mmW = avail.x, mmH = avail.x / aspect;
+        if (mmH > avail.y) { mmH = avail.y; mmW = avail.y * aspect; }
+
+        if (mmW > 8.0f && mmH > 8.0f) {
+            const ImVec2 c = ImGui::GetCursorPos();
+            ImGui::SetCursorPos(ImVec2(c.x + (avail.x - mmW) * 0.5f,
+                                       c.y + (avail.y - mmH) * 0.5f));
+            const ImVec2 mmMin = ImGui::GetCursorScreenPos();
+            const ImVec2 mmMax(mmMin.x + mmW, mmMin.y + mmH);
+
+            // The button captures the mouse, so dragging here pans the crop
+            // instead of moving the window.
+            ImGui::InvisibleButton("##minimapdrag", ImVec2(mmW, mmH));
+            const bool hovered = ImGui::IsItemHovered();
+            const bool active  = ImGui::IsItemActive();
+
+            const ImVec2 mouse = ImGui::GetIO().MousePos;
+            const float mu = (mouse.x - mmMin.x) / mmW;   // mouse in frame UV
+            const float mv = (mouse.y - mmMin.y) / mmH;
+
+            if (ImGui::IsItemActivated()) {
+                const float h = m_crop.Half();
+                const bool inside = std::abs(mu - m_crop.cx) <= h && std::abs(mv - m_crop.cy) <= h;
+                // Grab the rect where it was clicked; a click outside re-centres it.
+                m_minimapGrab = inside ? ImVec2(m_crop.cx - mu, m_crop.cy - mv)
+                                       : ImVec2(0.0f, 0.0f);
+            }
+            if (active)
+                m_crop.PanTo(mu + m_minimapGrab.x, mv + m_minimapGrab.y);
+            if (hovered || active)
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+
+            // Draw after PanTo so the rect follows the cursor this frame.
+            const float a = m_uiAlpha;
+            auto A = [&](int v) { return static_cast<int>(v * a); };
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+
+            dl->AddImage(reinterpret_cast<ImTextureID>(m_displayTexture), mmMin, mmMax,
+                         ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, A(255)));
+
+            const ImVec2 rMin(mmMin.x + m_crop.U0() * mmW, mmMin.y + m_crop.V0() * mmH);
+            const ImVec2 rMax(mmMin.x + m_crop.U1() * mmW, mmMin.y + m_crop.V1() * mmH);
+
+            // Dim everything outside the crop rect.
+            const ImU32 dim = IM_COL32(0, 0, 0, A(140));
+            dl->AddRectFilled(mmMin,                   ImVec2(mmMax.x, rMin.y), dim);  // top
+            dl->AddRectFilled(ImVec2(mmMin.x, rMax.y), mmMax,                   dim);  // bottom
+            dl->AddRectFilled(ImVec2(mmMin.x, rMin.y), ImVec2(rMin.x, rMax.y),  dim);  // left
+            dl->AddRectFilled(ImVec2(rMax.x, rMin.y),  ImVec2(mmMax.x, rMax.y), dim);  // right
+
+            dl->AddRect(rMin, rMax, IM_COL32(255, 210, 60, A(255)), 0.0f, 0,
+                        std::max(1.0f, 1.5f * s));
+            dl->AddRect(mmMin, mmMax, IM_COL32(255, 255, 255, A(120)), 0.0f, 0,
+                        std::max(1.0f, s));
+        }
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+}
+
 void App::ProcessEvents() {
     PROFILE_SCOPE();
     SDL_Event event;
@@ -1439,7 +1548,7 @@ void App::ProcessEvents() {
             }
             case SDLK_EQUALS: // + key (= without shift, + with shift)
             case SDLK_KP_PLUS: {
-                if (cmd) break;
+                if (cmd) { ZoomCrop(1.25f); break; }   // Ctrl/Cmd + '+' = zoom in
                 double spd = m_player.GetSpeed();
                 if (spd < 0.1) spd = 0.1;
                 else if (spd < 0.25) spd = 0.25;
@@ -1455,7 +1564,7 @@ void App::ProcessEvents() {
             }
             case SDLK_MINUS:
             case SDLK_KP_MINUS: {
-                if (cmd) break;
+                if (cmd) { ZoomCrop(1.0f / 1.25f); break; }   // Ctrl/Cmd + '-' = zoom out
                 double spd = m_player.GetSpeed();
                 if (spd > 8.0) spd = 8.0;
                 else if (spd > 4.0) spd = 4.0;
@@ -1469,6 +1578,12 @@ void App::ProcessEvents() {
                 FlashSpeed();
                 break;
             }
+            case SDLK_0:
+            case SDLK_KP_0:
+                if (!cmd) break;
+                m_crop.Reset();
+                FlashZoom();
+                break;
             case SDLK_I:
             case SDLK_LEFTBRACKET:
                 if (!noMod) break;
@@ -1553,6 +1668,11 @@ void App::ProcessEvents() {
                     // Plain T: cycle HDR->SDR tone-mapping operator (Shift = previous).
                     CycleTonemapper(shift ? -1 : +1);
                 }
+                break;
+            case SDLK_N:
+                if (!winMod) break;
+                m_showMinimap = !m_showMinimap;
+                BumpUIActivity();
                 break;
             case SDLK_M:
                 if (winMod) {
@@ -1696,6 +1816,7 @@ void App::Render() {
                 };
                 snap(m_anchorTimeline, "Timeline");
                 snap(m_anchorSegments, "Marks");
+                snap(m_anchorMinimap,  "Minimap");
                 snap(m_anchorHelp,     "Help");
             }
         } else {
@@ -1711,6 +1832,7 @@ void App::Render() {
                 floatingWindows[] = {
                     { "Timeline", &m_anchorTimeline },
                     { "Marks",    &m_anchorSegments },
+                    { "Minimap",  &m_anchorMinimap },
                     { "Help",     &m_anchorHelp },
                 };
             float margin = 20.0f;
@@ -1979,6 +2101,9 @@ void App::Render() {
                 m_showSegments = !m_showSegments;
                 if (!m_showSegments) m_segmentsClosedManually = true;
             }
+            if (ImGui::MenuItem("Minimap", (std::string(kKeys.winModName) + "+N").c_str(), m_showMinimap))
+                m_showMinimap = !m_showMinimap;
+            TooltipFor("Overview of the whole frame, shown while zoomed in.");
             if (ImGui::MenuItem("Help", (std::string(kKeys.winModName) + "+H or ?").c_str(), m_showHelpPanel))
                 m_showHelpPanel = !m_showHelpPanel;
             ImGui::SeparatorText("Settings");
@@ -2073,6 +2198,42 @@ void App::Render() {
                 }
             }
             SubtitleSizeControl("view");
+            // Video zoom: same row layout as UI Scale / Subtitle Size, shown as
+            // a factor (1.00x .. 16.00x). The -/+ buttons use the multiplicative
+            // step of Ctrl +/- (an additive step would take dozens of clicks to
+            // cross the range); the field accepts a typed factor.
+            {
+                ImGui::BeginDisabled(!m_player.HasMedia());
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted("Video Zoom");
+                TooltipFor("Zoom into the video; drag the minimap to pan",
+                           (std::string(kKeys.cmdName) + " + Plus / Minus").c_str());
+                ImGui::SameLine();
+                const ImGuiStyle& st = ImGui::GetStyle();
+                float btn = ImGui::GetFrameHeight();
+                float fieldW = ImGui::CalcTextSize("0.00x").x + st.FramePadding.x * 2.0f;
+                float resetW = ImGui::CalcTextSize("1").x + st.FramePadding.x * 2.0f;
+                float rowW = fieldW + 2.0f * (btn + st.ItemInnerSpacing.x)
+                           + st.ItemInnerSpacing.x + resetW;
+                float avail = ImGui::GetContentRegionAvail().x;
+                if (avail > rowW)
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - rowW));
+
+                ImGui::SetNextItemWidth(fieldW);
+                float z = m_crop.zoom;
+                const char* zoomFmt = (z >= 9.995f) ? "%.1fx" : "%.2fx";
+                if (ImGui::InputFloat("##videozoom", &z, 0.0f, 0.0f, zoomFmt)) {
+                    m_crop.zoom = z;
+                    m_crop.Clamp();
+                }
+                ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                if (ImGui::Button("-##videozoom", ImVec2(btn, btn))) ZoomCrop(1.0f / 1.25f);
+                ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                if (ImGui::Button("+##videozoom", ImVec2(btn, btn))) ZoomCrop(1.25f);
+                ImGui::SameLine(0, st.ItemInnerSpacing.x);
+                if (ImGui::Button("1##videozoom")) m_crop.Reset();
+                ImGui::EndDisabled();
+            }
             if (ImGui::MenuItem("Auto-hide Mouse Cursor", nullptr, m_autoHideCursor))
                 m_autoHideCursor = !m_autoHideCursor;
             if (ImGui::MenuItem("Auto-hide UI", nullptr, m_autoHideUI))
@@ -2325,13 +2486,17 @@ void App::Render() {
             cursor.x + (avail.x - displayW) * 0.5f,
             cursor.y + (avail.y - displayH) * 0.5f
         ));
-        ImGui::Image(reinterpret_cast<ImTextureID>(m_displayTexture), ImVec2(displayW, displayH));
+
+        ImGui::Image(reinterpret_cast<ImTextureID>(m_displayTexture),
+                     ImVec2(displayW, displayH),
+                     ImVec2(m_crop.U0(), m_crop.V0()),
+                     ImVec2(m_crop.U1(), m_crop.V1()));
         ImVec2 imgMin = ImGui::GetItemRectMin();
         ImVec2 imgMax = ImGui::GetItemRectMax();
         // Click the video to toggle play/pause; double-click to toggle
-        // fullscreen. ImGui fires both single and double click on the second
-        // click of a double-click, so the play/pause toggles cancel out and
-        // the user sees only a fullscreen change (matches VLC / MPC-HC).
+        // fullscreen. (...оставьте исходный комментарий...)
+        // Ignored while the pointer is on the minimap, otherwise dragging the
+        // crop rect would pause the video.
         if (ImGui::IsItemHovered()) {
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 TogglePlayPauseWithFlash();
@@ -3393,6 +3558,8 @@ void App::Render() {
     ImGui::PopStyleVar();
     } // m_showSegments
 
+    RenderMinimapWindow(layoutCond, wasResetFrame);
+
     // Help panel (toggled with ?)
     if (m_showHelpPanel && !m_uiHidden) {
         PROFILE_SCOPE_N("Help panel");
@@ -3418,6 +3585,7 @@ void App::Render() {
                 {"Show / hide UI",  "H"},
                 {"Toggle timeline", std::string(kKeys.winModName) + " + T"},
                 {"Toggle marks",    std::string(kKeys.winModName) + " + M"},
+                {"Toggle minimap",  std::string(kKeys.winModName) + " + N"},
                 {"Toggle help",     std::string(kKeys.winModName) + " + H  or  ?"},
                 {"Quit",            kKeys.quitShortcut},
             }},
@@ -3430,6 +3598,8 @@ void App::Render() {
                 {"Jump to start / end", kKeys.jumpName},
                 {"Prev / next chapter", "J / K"},
                 {"Speed up / down",     "+ / -"},
+                {"Zoom in / out",        std::string(kKeys.cmdName) + " + Plus / Minus"},
+                {"Reset zoom",           std::string(kKeys.cmdName) + " + 0"},
                 {"Precision scrub",     std::string(kKeys.altKeyName) + " + drag timeline"},
             }},
             {"Cut", {
@@ -4826,6 +4996,7 @@ void App::RestoreFloatingWindowSnapshots() {
     };
     restore(m_snapTimeline, "Timeline");
     restore(m_snapSegments, "Marks");
+    restore(m_snapMinimap,  "Minimap");
     restore(m_snapHelp,     "Help");
 }
 
@@ -4857,6 +5028,7 @@ void App::SetFullscreen(bool fullscreen) {
             };
             snap(m_snapTimeline, "Timeline");
             snap(m_snapSegments, "Marks");
+            snap(m_snapMinimap,  "Minimap");
             snap(m_snapHelp,     "Help");
         }
         m_waitingForFullscreenExit = false;
