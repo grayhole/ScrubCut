@@ -308,6 +308,11 @@ private:
     // When off, exported files are named by mark name alone (no base name or
     // delimiter). Persisted across sessions.
     bool m_exportUseBaseName = true;
+    // Merged-export dialog mode (opened from the Marks "1v" button): every
+    // checked segment goes into ONE MP4 instead of one file per mark. See
+    // ExportSettings::mergeSegments.
+    bool m_exportMerged = false;
+    bool m_exportMergedKeepAudio = true;
 
     // Export output-directory mode. SameAsVideo (default) auto-fills the
     // export dir with the opened video's parent on each open. Custom uses
