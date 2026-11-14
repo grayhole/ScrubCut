@@ -87,6 +87,17 @@ private:
                                   const TimeRange& range,
                                   const std::string& outputPath);
 
+    // Stream-copy every segment into ONE MP4: packets from each segment's
+    // keyframe onward are laid on one continuous media timeline, and the
+    // MP4 edit lists (one entry per segment and track) hide the pre-roll and
+    // trailing reference frames. Video + audio only (no subtitles). `keepAudio`
+    // is the already-resolved decision. Deletes the partial file on failure
+    // or cancel.
+    bool ExportMergedStreamCopy(const std::string& inputPath,
+                                const std::vector<TimeRange>& segments,
+                                bool keepAudio,
+                                const std::string& outputPath);
+
     bool ExportSegmentGIF(const std::string& inputPath,
                           const TimeRange& range,
                           const std::string& outputPath,
