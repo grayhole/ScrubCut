@@ -21,6 +21,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -116,6 +117,30 @@ void Exporter::ExportThread() {
     // GIF source therefore re-encodes via the GIF path with source W/FPS.
     bool srcIsGif = (srcExtLower == ".gif");
     std::string sourceFormatExt = remuxToMp4 ? ".mp4" : srcExt;
+
+    // Merged export: every segment goes into one MP4 (source format only).
+    if (m_settings.mergeSegments) {
+        if (srcIsGif) {
+            m_progress.SetError("Merging segments is not supported for GIF sources");
+            finish();
+            return;
+        }
+        const bool keepAudio = m_settings.mergedKeepAudio &&
+                               !MergedAudioForciblyDropped(m_settings.segments);
+        const std::string mergedPath = m_settings.outputPath + ".mp4";
+        m_progress.totalItems = static_cast<int>(m_settings.segments.size());
+        LOG_INFO("Exporting %zu segment(s) merged (stream copy) -> %s",
+                 m_settings.segments.size(), mergedPath.c_str());
+        const bool ok = ExportMergedStreamCopy(m_inputPath, m_settings.segments, keepAudio, mergedPath);
+        if (ok) {
+            recordOutput(mergedPath);
+            m_progress.fraction = 1.0f;
+            m_progress.finished = true;
+            LOG_INFO("Export complete");
+        }
+        finish();
+        return;
+    }
 
     for (int i = 0; i < static_cast<int>(m_settings.segments.size()); i++) {
         if (m_cancel) break;
@@ -448,6 +473,235 @@ static bool TrimMp4Presentation(const std::string& path, double presentationSec)
     f.seekp(moovPos);
     f.write(reinterpret_cast<const char*>(moov.data()), static_cast<std::streamsize>(moov.size()));
     return static_cast<bool>(f);
+}
+
+// ---------------------------------------------------------------------------
+// MP4 multi-entry edit lists (merged export)
+// ---------------------------------------------------------------------------
+// One entry per merged segment: where in the track's media timeline to start
+// (the segment's in frame) and how long to play. libavformat's mov muxer can
+// only write a single edit per track, so after muxing we rebuild every track's
+// edts/elst ourselves. moov has to be the last top-level atom (the muxer's
+// default - no faststart), so that growing it doesn't shift any sample data.
+struct MergedEdit {
+    double visibleSec = 0.0;  // presentation length of this entry
+    int64_t mediaTime = -1;   // track-timescale ticks of the start; -1 = empty edit
+};
+
+static void PutBE16(std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back(uint8_t(x >> 8));
+    v.push_back(uint8_t(x));
+}
+static void PutBE32(std::vector<uint8_t>& v, uint32_t x) {
+    for (int s = 24; s >= 0; s -= 8) v.push_back(uint8_t(x >> s));
+}
+static void PutBE64(std::vector<uint8_t>& v, uint64_t x) {
+    for (int s = 56; s >= 0; s -= 8) v.push_back(uint8_t(x >> s));
+}
+
+struct RawBox {
+    char type[4] = {0, 0, 0, 0};
+    std::vector<uint8_t> payload;
+};
+
+static void AppendBox(std::vector<uint8_t>& out, const char* type, const std::vector<uint8_t>& payload) {
+    PutBE32(out, static_cast<uint32_t>(8 + payload.size()));
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), payload.begin(), payload.end());
+}
+
+// Split a box payload into its child boxes. 64-bit / to-end-of-file sizes are
+// not expected inside moov; returns false for anything unusual.
+static bool SplitBoxes(const uint8_t* p, size_t n, std::vector<RawBox>& out) {
+    size_t pos = 0;
+    while (pos + 8 <= n) {
+        const uint64_t size = Rd32(p + pos);
+        if (size < 8 || pos + size > n) return false;
+        RawBox b;
+        memcpy(b.type, p + pos + 4, 4);
+        b.payload.assign(p + pos + 8, p + pos + size);
+        out.push_back(std::move(b));
+        pos += static_cast<size_t>(size);
+    }
+    return pos == n;
+}
+
+// Replace every track's edit list. `tracks[i]` belongs to the i-th trak box,
+// which is the i-th stream written (the muxer emits traks in stream order).
+// Also sets mvhd / tkhd durations to the new presentation length. Returns
+// false, leaving the file untouched, if the layout isn't as expected.
+static bool RewriteMp4EditLists(const std::string& path,
+                                const std::vector<std::vector<MergedEdit>>& tracks) {
+    std::fstream f(std::filesystem::u8path(path), std::ios::in | std::ios::out | std::ios::binary);
+    if (!f) return false;
+    f.seekg(0, std::ios::end);
+    const int64_t fileSize = static_cast<int64_t>(f.tellg());
+
+    // Top-level atoms: moov must exist and be the last one.
+    int64_t moovPos = -1;
+    uint64_t moovSize = 0;
+    size_t moovHdr = 8;
+    for (int64_t pos = 0; pos + 8 <= fileSize;) {
+        uint8_t hdr[16];
+        f.seekg(pos);
+        f.read(reinterpret_cast<char*>(hdr), 8);
+        if (!f) return false;
+        uint64_t size = Rd32(hdr);
+        size_t hdrLen = 8;
+        if (size == 1) {
+            f.read(reinterpret_cast<char*>(hdr + 8), 8);
+            if (!f) return false;
+            size = Rd64(hdr + 8);
+            hdrLen = 16;
+        } else if (size == 0) {
+            size = static_cast<uint64_t>(fileSize - pos);
+        }
+        if (size < hdrLen) return false;
+        if (memcmp(hdr + 4, "moov", 4) == 0) {
+            moovPos = pos;
+            moovSize = size;
+            moovHdr = hdrLen;
+        }
+        pos += static_cast<int64_t>(size);
+    }
+    if (moovPos < 0 || moovSize > (uint64_t(64) << 20) ||
+        moovPos + static_cast<int64_t>(moovSize) != fileSize)
+        return false;
+
+    std::vector<uint8_t> moov(static_cast<size_t>(moovSize));
+    f.seekg(moovPos);
+    f.read(reinterpret_cast<char*>(moov.data()), static_cast<std::streamsize>(moov.size()));
+    if (!f) return false;
+
+    std::vector<RawBox> kids;
+    if (!SplitBoxes(moov.data() + moovHdr, moov.size() - moovHdr, kids)) return false;
+
+    // mvhd: movie timescale (elst durations are in it) and total duration.
+    RawBox* mvhd = nullptr;
+    for (RawBox& b : kids)
+        if (memcmp(b.type, "mvhd", 4) == 0) { mvhd = &b; break; }
+    if (!mvhd || mvhd->payload.size() < 32) return false;
+    const bool mvhdWide = mvhd->payload[0] != 0;
+    const uint32_t movieTs = Rd32(&mvhd->payload[mvhdWide ? 20 : 12]);
+    if (movieTs == 0) return false;
+
+    // Each entry must be no LONGER than its exact length. The next segment's
+    // first frame sits exactly on the boundary, and an edit that runs even a
+    // fraction of a tick past it shows that frame (with a 1 ms movie timescale
+    // that happened in about a fifth of all cuts). So round DOWN and take off one
+    // media tick's worth of slack, covering the movie->media timescale
+    // conversion that demuxers round. The last visible frame starts at least
+    // one frame before the end, so it can't be lost; the file ends up at most a
+    // few ms shorter than the sum of its segments.
+    auto buildElst = [&](const std::vector<MergedEdit>& edits, uint32_t mediaTs, uint64_t& totalMovie) {
+        const uint64_t slack = std::max<uint64_t>(1, (uint64_t(movieTs) + mediaTs - 1) / std::max<uint32_t>(mediaTs, 1));
+        std::vector<std::pair<uint64_t, int64_t>> rows;
+        bool wide = false;
+        totalMovie = 0;
+        for (const MergedEdit& e : edits) {
+            uint64_t d = static_cast<uint64_t>(std::floor(e.visibleSec * movieTs));
+            d = d > slack ? d - slack : 1;
+            rows.emplace_back(d, e.mediaTime);
+            totalMovie += d;
+            if (d > 0x7FFFFFFFull || e.mediaTime > 0x7FFFFFFFll) wide = true;
+        }
+
+        std::vector<uint8_t> body;
+        body.push_back(wide ? 1 : 0);
+        body.push_back(0); body.push_back(0); body.push_back(0);  // flags
+        PutBE32(body, static_cast<uint32_t>(rows.size()));
+        for (const auto& r : rows) {
+            if (wide) {
+                PutBE64(body, r.first);
+                PutBE64(body, static_cast<uint64_t>(r.second));
+            } else {
+                PutBE32(body, static_cast<uint32_t>(r.first));
+                PutBE32(body, static_cast<uint32_t>(static_cast<int32_t>(r.second)));
+            }
+            PutBE16(body, 1);  // media rate 1.0
+            PutBE16(body, 0);
+        }
+        std::vector<uint8_t> box;
+        AppendBox(box, "elst", body);
+        return box;
+    };
+
+    size_t trakIdx = 0;
+    uint64_t movieTotal = 0;
+    for (RawBox& trak : kids) {
+        if (memcmp(trak.type, "trak", 4) != 0) continue;
+        if (trakIdx >= tracks.size()) return false;
+        std::vector<RawBox> tk;
+        if (!SplitBoxes(trak.payload.data(), trak.payload.size(), tk)) return false;
+
+        // Media timescale of this track: mdia/mdhd.
+        uint32_t mediaTs = 0;
+        for (const RawBox& b : tk) {
+            if (memcmp(b.type, "mdia", 4) != 0) continue;
+            std::vector<RawBox> md;
+            if (!SplitBoxes(b.payload.data(), b.payload.size(), md)) return false;
+            for (const RawBox& m : md) {
+                if (memcmp(m.type, "mdhd", 4) != 0 || m.payload.size() < 24) continue;
+                mediaTs = Rd32(&m.payload[m.payload[0] != 0 ? 20 : 12]);
+            }
+        }
+        if (mediaTs == 0) return false;
+
+        uint64_t total = 0;
+        const std::vector<uint8_t> elst = buildElst(tracks[trakIdx], mediaTs, total);
+        movieTotal = std::max(movieTotal, total);
+        trakIdx++;
+
+        std::vector<uint8_t> rebuilt;
+        bool sawTkhd = false;
+        for (RawBox& b : tk) {
+            if (memcmp(b.type, "edts", 4) == 0) continue;  // replaced below
+            const bool isTkhd = memcmp(b.type, "tkhd", 4) == 0;
+            if (isTkhd) {
+                const bool wide = !b.payload.empty() && b.payload[0] != 0;
+                const size_t off = wide ? 28 : 20;
+                if (b.payload.size() < off + (wide ? 8u : 4u)) return false;
+                if (wide) {
+                    uint8_t* p = &b.payload[off];
+                    for (int i = 0; i < 8; i++) p[i] = uint8_t(total >> (56 - 8 * i));
+                } else {
+                    Wr32(&b.payload[off], static_cast<uint32_t>(total));
+                }
+                sawTkhd = true;
+            }
+            AppendBox(rebuilt, std::string(b.type, 4).c_str(), b.payload);
+            if (isTkhd) AppendBox(rebuilt, "edts", elst);  // edts goes right after tkhd
+        }
+        if (!sawTkhd) return false;
+        trak.payload = std::move(rebuilt);
+    }
+    if (trakIdx != tracks.size()) return false;
+
+    // mvhd duration = longest track.
+    if (mvhdWide) {
+        uint8_t* p = &mvhd->payload[24];
+        for (int i = 0; i < 8; i++) p[i] = uint8_t(movieTotal >> (56 - 8 * i));
+    } else {
+        Wr32(&mvhd->payload[16], static_cast<uint32_t>(movieTotal));
+    }
+
+    std::vector<uint8_t> newMoovPayload;
+    for (const RawBox& b : kids)
+        AppendBox(newMoovPayload, std::string(b.type, 4).c_str(), b.payload);
+    std::vector<uint8_t> newMoov;
+    AppendBox(newMoov, "moov", newMoovPayload);
+
+    f.clear();
+    f.seekp(moovPos);
+    f.write(reinterpret_cast<const char*>(newMoov.data()), static_cast<std::streamsize>(newMoov.size()));
+    f.flush();
+    if (!f) return false;
+    f.close();
+    // The new moov may be shorter than the muxer's (e.g. one segment).
+    std::error_code ec;
+    std::filesystem::resize_file(std::filesystem::u8path(path),
+                                 static_cast<uintmax_t>(moovPos) + newMoov.size(), ec);
+    return !ec;
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,6 +1291,378 @@ cleanup:
         avio_closep(&outFmt->pb);
     avformat_free_context(outFmt);
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Merged stream-copy export: all segments in ONE MP4
+// ---------------------------------------------------------------------------
+// Every segment is copied the same way as in ExportSegmentStreamCopy (packets
+// from the keyframe at or before mark-in, up to the out frame plus the frames
+// decoded before it), but onto one continuous media timeline:
+//  - each segment's timestamps are rebased against its in frame, then shifted
+//    so DTS keeps increasing and stays >= 0 (so the muxer writes no edit list
+//    of its own);
+//  - a segment starts no earlier than the end of the previous segment's edit
+//    window. B-frame reordering lets the next segment's PTS run ahead of its
+//    DTS; without this gap its first (hidden pre-roll) frames land inside the
+//    previous edit and players show them;
+//  - afterwards the edit lists are rewritten, one entry per segment: start at
+//    the in frame, play for the segment's (post-speed) length.
+// Nothing is re-encoded.
+
+// Audio is cut on packet boundaries; keep a couple of packets before mark-in
+// as decoder lead-in (the edit list still starts playback exactly on mark-in)
+// instead of the seconds of audio between the video keyframe and mark-in.
+static constexpr int kMergedAudioLeadInPackets = 2;
+
+bool Exporter::ExportMergedStreamCopy(const std::string& inputPath,
+                                      const std::vector<TimeRange>& segments,
+                                      bool keepAudio,
+                                      const std::string& outputPath) {
+    PROFILE_SCOPE();
+    if (segments.empty()) {
+        m_progress.SetError("No segments to merge");
+        return false;
+    }
+
+    Demuxer demuxer;
+    if (!demuxer.Open(inputPath, "export")) {
+        m_progress.SetError("Failed to open input: " + inputPath);
+        return false;
+    }
+    AVFormatContext* inFmt = demuxer.GetFormatContext();
+    const int videoInIdx = demuxer.GetVideoStreamIndex();
+    if (videoInIdx < 0) {
+        m_progress.SetError("Merged export needs a video stream");
+        return false;
+    }
+    const AVRational vtb = inFmt->streams[videoInIdx]->time_base;
+    const size_t nSeg = segments.size();
+    const int nIn = static_cast<int>(inFmt->nb_streams);
+
+    // Resolve every segment to the frames shown at its marks.
+    std::vector<SegmentFrames> frames(nSeg);
+    std::vector<double> visibleSec(nSeg, 0.0);  // presentation length, after speed
+    for (size_t k = 0; k < nSeg; k++) {
+        if (!ResolveSegmentFrames(demuxer, segments[k], frames[k])) {
+            m_progress.SetError("Segment " + std::to_string(k + 1) +
+                                ": the video has no timestamps to cut on");
+            return false;
+        }
+        const double speed = segments[k].speed > 0.0 ? segments[k].speed : 1.0;
+        visibleSec[k] = static_cast<double>(frames[k].outPts + frames[k].outDur - frames[k].inPts) *
+                        av_q2d(vtb) / speed;
+    }
+
+    // Owns everything created below; also deletes the partial file unless
+    // `keepFile` is set, so every early return (error or cancel) is clean.
+    struct Guard {
+        AVFormatContext* out = nullptr;
+        AVBSFContext* bsf = nullptr;
+        AVPacket* pkt = nullptr;
+        bool headerWritten = false;
+        bool trailerWritten = false;
+        bool keepFile = false;
+        std::string path;
+        ~Guard() {
+            if (pkt) av_packet_free(&pkt);
+            if (bsf) av_bsf_free(&bsf);
+            if (out) {
+                if (headerWritten && !trailerWritten) av_write_trailer(out);
+                if (!(out->oformat->flags & AVFMT_NOFILE) && out->pb) avio_closep(&out->pb);
+                avformat_free_context(out);
+            }
+            if (!keepFile) {
+                std::error_code ec;
+                std::filesystem::remove(std::filesystem::u8path(path), ec);
+            }
+        }
+    } g;
+    g.path = outputPath;
+
+    int ret = avformat_alloc_output_context2(&g.out, nullptr, "mp4", outputPath.c_str());
+    if (ret < 0 || !g.out) {
+        m_progress.SetError("Failed to create output context: " + ff::ErrorString(ret));
+        return false;
+    }
+
+    // A frame-rate rewrite in the parameter sets (see OpenTimingRewriteFilter)
+    // is only possible when every segment runs at the same speed: the output has
+    // one set of parameters. Mixed speeds still play right - players follow the
+    // container timestamps - but tools reading the embedded rate may disagree.
+    bool sameSpeed = true;
+    const double firstSpeed = segments[0].speed > 0.0 ? segments[0].speed : 1.0;
+    for (const TimeRange& r : segments)
+        if (std::abs((r.speed > 0.0 ? r.speed : 1.0) - firstSpeed) > 1e-6) sameSpeed = false;
+    const bool scaledForAll = sameSpeed && std::abs(firstSpeed - 1.0) > 1e-6;
+
+    // Map the video stream and (if kept) every audio stream the MP4 muxer
+    // accepts. Other streams (subtitles, data, attachments) are not copied.
+    std::vector<int> outIdxOf(nIn, -1);
+    std::vector<int> inIdxOfOut;
+    for (int i = 0; i < nIn; i++) {
+        AVStream* inStream = inFmt->streams[i];
+        const AVCodecParameters* par = inStream->codecpar;
+        const bool isVideo = (i == videoInIdx);
+        if (!isVideo && !(keepAudio && par->codec_type == AVMEDIA_TYPE_AUDIO)) continue;
+        if (avformat_query_codec(g.out->oformat, par->codec_id, FF_COMPLIANCE_NORMAL) == 0) {
+            if (isVideo) {
+                m_progress.SetError(std::string("The video codec (") + avcodec_get_name(par->codec_id) +
+                                    ") can't be stored in an MP4 file");
+                return false;
+            }
+            LOG_WARN("Merged export: dropping audio stream %d (%s can't be stored in MP4)",
+                     i, avcodec_get_name(par->codec_id));
+            continue;
+        }
+        AVStream* outStream = avformat_new_stream(g.out, nullptr);
+        if (!outStream) {
+            m_progress.SetError("Failed to create output stream");
+            return false;
+        }
+        avcodec_parameters_copy(outStream->codecpar, par);
+        if (isVideo && scaledForAll) {
+            g.bsf = OpenTimingRewriteFilter(inFmt, videoInIdx, firstSpeed);
+            if (g.bsf) avcodec_parameters_copy(outStream->codecpar, g.bsf->par_out);
+        }
+        outStream->codecpar->codec_tag = 0;
+        outStream->disposition = inStream->disposition;
+        CopyTags(&outStream->metadata, inStream->metadata);
+        outIdxOf[i] = outStream->index;
+        inIdxOfOut.push_back(i);
+    }
+    CopyTags(&g.out->metadata, inFmt->metadata);
+    av_dict_set(&g.out->metadata, "encoder", nullptr, 0);  // the muxer writes its own
+
+    ret = avio_open(&g.out->pb, outputPath.c_str(), AVIO_FLAG_WRITE);
+    if (ret < 0) {
+        m_progress.SetError("Failed to open output file: " + ff::ErrorString(ret));
+        return false;
+    }
+    ret = avformat_write_header(g.out, nullptr);
+    if (ret < 0) {
+        m_progress.SetError("Failed to write header: " + ff::ErrorString(ret) +
+                            " (the source codecs may not be supported in MP4)");
+        return false;
+    }
+    g.headerWritten = true;
+
+    // Per-input-stream timeline state, carried across segments.
+    constexpr int64_t kNo = AV_NOPTS_VALUE;
+    std::vector<int64_t> nextDts(nIn, 0);        // where the next segment may start (out ticks)
+    std::vector<int64_t> editEnd(nIn, 0);        // end of the previous edit's media window
+    std::vector<int64_t> lastOutDts(nIn, kNo);
+    std::vector<int64_t> lastSrcDts(nIn, kNo);
+    std::vector<int64_t> offset(nIn, kNo);       // current segment's shift (out ticks)
+    // media_time of each segment's edit, per output stream (kNo = no packets there).
+    std::vector<std::vector<int64_t>> mediaTime(inIdxOfOut.size(), std::vector<int64_t>(nSeg, kNo));
+    int nudged = 0;
+
+    const double fps = demuxer.GetVideoFrameRate();
+    const int64_t nominalVideoDur = (fps > 0.0) ? ff::SecondsToPts(1.0 / fps, vtb) : 1;
+    const int64_t marginTs = ff::SecondsToPts(1.0, vtb);
+
+    g.pkt = av_packet_alloc();
+    AVPacket* pkt = g.pkt;
+
+    for (size_t k = 0; k < nSeg && !m_cancel; k++) {
+        const TimeRange& range = segments[k];
+        const SegmentFrames& sf = frames[k];
+        m_progress.currentItem = static_cast<int>(k + 1);
+
+        const double speed = range.speed > 0.0 ? range.speed : 1.0;
+        const bool speedScaled = std::abs(speed - 1.0) > 1e-6;
+        const double speedInv = 1.0 / speed;
+        const double srcLenSec = static_cast<double>(sf.outPts + sf.outDur - sf.inPts) * av_q2d(vtb);
+
+        // Per-stream bounds in each stream's own time base. Video ends at the
+        // out frame (inclusive); audio where that frame's display ends.
+        const int64_t videoEndTs = sf.outPts + sf.outDur;
+        std::vector<int64_t> segStart(nIn, 0), segEnd(nIn, 0);
+        for (int i : inIdxOfOut) {
+            if (i == videoInIdx) {
+                segStart[i] = sf.inPts;
+                segEnd[i] = sf.outPts;
+                continue;
+            }
+            const AVRational tb = inFmt->streams[i]->time_base;
+            segStart[i] = av_rescale_q(sf.inPts, vtb, tb);
+            segEnd[i] = av_rescale_q(videoEndTs, vtb, tb);
+        }
+
+        std::fill(offset.begin(), offset.end(), kNo);
+        std::fill(lastSrcDts.begin(), lastSrcDts.end(), kNo);
+        demuxer.Seek(range.startSec);
+
+        bool done = false;
+        while (!done && !m_cancel) {
+            ret = demuxer.ReadPacket(pkt);
+            if (ret == AVERROR_EOF) break;
+            if (ret < 0) {
+                m_progress.SetError("Read error: " + ff::ErrorString(ret));
+                return false;
+            }
+            const int inIdx = pkt->stream_index;
+            const int outIdx = (inIdx >= 0 && inIdx < nIn) ? outIdxOf[inIdx] : -1;
+            if (outIdx < 0) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            const bool isVideo = (inIdx == videoInIdx);
+            AVStream* inStream = inFmt->streams[inIdx];
+            AVStream* outStream = g.out->streams[outIdx];
+
+            if (isVideo && g.bsf) {
+                ret = av_bsf_send_packet(g.bsf, pkt);
+                if (ret >= 0) ret = av_bsf_receive_packet(g.bsf, pkt);
+                if (ret == AVERROR(EAGAIN)) continue;
+                if (ret < 0) {
+                    m_progress.SetError("Frame-rate rewrite failed: " + ff::ErrorString(ret));
+                    return false;
+                }
+            }
+
+            if (pkt->pts == AV_NOPTS_VALUE && pkt->dts == AV_NOPTS_VALUE) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            if (pkt->pts == AV_NOPTS_VALUE) pkt->pts = pkt->dts;
+
+            // Matroska stores no DTS; after a seek the demuxer can't derive one
+            // for the first packet of a stream with reordered frames. Fill gaps
+            // like the ffmpeg CLI: the first packet sits the reorder delay
+            // before its pts, later ones follow the previous dts, never past pts.
+            if (pkt->dts == AV_NOPTS_VALUE) {
+                if (!isVideo) {
+                    pkt->dts = pkt->pts;
+                } else {
+                    int64_t frameDur = pkt->duration;
+                    if (frameDur <= 0) frameDur = nominalVideoDur;
+                    frameDur = std::max<int64_t>(frameDur, 1);
+                    const int64_t guess = (lastSrcDts[inIdx] != kNo)
+                        ? lastSrcDts[inIdx] + frameDur
+                        : pkt->pts - std::max(inStream->codecpar->video_delay, 1) * frameDur;
+                    pkt->dts = std::min(guess, pkt->pts);
+                }
+            }
+            lastSrcDts[inIdx] = pkt->dts;
+
+            // Done once video DTS is a margin past the out frame: trailing
+            // B-frames arrive after it in decode order, interleaved audio may lag.
+            if (isVideo && pkt->dts > sf.outPts + marginTs) {
+                done = true;
+                av_packet_unref(pkt);
+                continue;
+            }
+
+            // Drop packets past the segment (but keep reading: later packets in
+            // decode order may still be in range). Video keeps everything up to
+            // the out frame plus the frames decoded before it - references its
+            // trailing B-frames may need; the edit list hides those.
+            if (isVideo) {
+                const bool decodedBeforeOut = sf.outDts != kNo && pkt->dts <= sf.outDts;
+                if (pkt->pts > sf.outPts && !decodedBeforeOut) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+            } else {
+                const int64_t lead = kMergedAudioLeadInPackets * std::max<int64_t>(pkt->duration, 1);
+                if (pkt->pts >= segEnd[inIdx] ||
+                    pkt->pts + std::max<int64_t>(pkt->duration, 0) <= segStart[inIdx] - lead) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+            }
+
+            if (isVideo && srcLenSec > 0.0) {
+                const double t = static_cast<double>(pkt->pts - sf.inPts) * av_q2d(vtb);
+                const float segProgress = static_cast<float>(std::min(std::max(t / srcLenSec, 0.0), 1.0));
+                m_progress.fraction = (static_cast<float>(k) + segProgress) / static_cast<float>(nSeg);
+            }
+
+            // Rebase against the in frame into output ticks; speed scales video.
+            const int64_t start = segStart[inIdx];
+            const AVRational itb = inStream->time_base;
+            const AVRational otb = outStream->time_base;
+            int64_t pts = av_rescale_q(pkt->pts - start, itb, otb);
+            int64_t dts = av_rescale_q(pkt->dts - start, itb, otb);
+            int64_t dur = av_rescale_q(pkt->duration > 0 ? pkt->duration
+                                                          : (isVideo ? nominalVideoDur : 1), itb, otb);
+            if (isVideo && speedScaled) {
+                pts = static_cast<int64_t>(std::llround(static_cast<double>(pts) * speedInv));
+                dts = static_cast<int64_t>(std::llround(static_cast<double>(dts) * speedInv));
+                dur = static_cast<int64_t>(std::llround(static_cast<double>(dur) * speedInv));
+            }
+            dur = std::max<int64_t>(dur, 1);
+
+            if (offset[inIdx] == kNo) {
+                // First packet of this stream in this segment. The in frame has
+                // rebased pts 0, so after the shift it sits at `offset`.
+                offset[inIdx] = std::max(nextDts[inIdx], editEnd[inIdx]) - dts;
+                mediaTime[outIdx][k] = offset[inIdx];
+            }
+            pts += offset[inIdx];
+            dts += offset[inIdx];
+
+            // The mp4 muxer needs strictly increasing DTS. Millisecond time bases
+            // (Matroska) can yield equal DTS after a seek; nudge by one tick.
+            if (lastOutDts[inIdx] != kNo && dts <= lastOutDts[inIdx]) {
+                dts = lastOutDts[inIdx] + 1;
+                nudged++;
+            }
+            if (pts < dts) pts = dts;
+            lastOutDts[inIdx] = dts;
+            nextDts[inIdx] = dts + dur;
+
+            pkt->stream_index = outIdx;
+            pkt->pts = pts;
+            pkt->dts = dts;
+            pkt->duration = dur;
+            pkt->pos = -1;
+            ret = av_interleaved_write_frame(g.out, pkt);
+            if (ret < 0) {
+                m_progress.SetError("Write error: " + ff::ErrorString(ret));
+                return false;
+            }
+            av_packet_unref(pkt);
+        }
+        if (m_cancel) break;
+
+        // Where this segment's edit window ends on each track (plus one frame of
+        // margin so rounding in the edit list can't reach into the next segment).
+        const double marginSec = std::max(static_cast<double>(sf.outDur) * av_q2d(vtb), 0.0);
+        for (size_t o = 0; o < inIdxOfOut.size(); o++) {
+            const int i = inIdxOfOut[o];
+            if (mediaTime[o][k] == kNo) {
+                LOG_WARN("Merged export: segment %zu has no packets on output stream %zu; "
+                         "writing an empty edit", k + 1, o);
+                continue;
+            }
+            const double tickSec = av_q2d(g.out->streams[o]->time_base);
+            editEnd[i] = mediaTime[o][k] +
+                         static_cast<int64_t>(std::llround(visibleSec[k] / tickSec)) +
+                         std::max<int64_t>(1, static_cast<int64_t>(std::llround(marginSec / tickSec)));
+        }
+    }
+    if (m_cancel) return false;
+
+    if (nudged > 0)
+        LOG_INFO("Merged export: nudged %d non-increasing DTS value(s) by one tick", nudged);
+
+    av_write_trailer(g.out);
+    g.trailerWritten = true;
+    if (!(g.out->oformat->flags & AVFMT_NOFILE)) avio_closep(&g.out->pb);
+
+    std::vector<std::vector<MergedEdit>> tracks(inIdxOfOut.size());
+    for (size_t o = 0; o < tracks.size(); o++)
+        for (size_t k = 0; k < nSeg; k++)
+            tracks[o].push_back({visibleSec[k], mediaTime[o][k] == kNo ? int64_t(-1) : mediaTime[o][k]});
+    if (!RewriteMp4EditLists(outputPath, tracks)) {
+        m_progress.SetError("Failed to write the MP4 edit lists; the merged file would not play correctly");
+        return false;
+    }
+    g.keepFile = true;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

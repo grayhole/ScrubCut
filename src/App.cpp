@@ -2039,6 +2039,7 @@ void App::Render() {
                 InitExportDir();
                 snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
                 m_pendingExport = ExportSettings{};
+                m_exportMerged = false;
             }
             ImGui::Separator();
 #if defined(__APPLE__)
@@ -3602,20 +3603,56 @@ void App::Render() {
     }
     ImGui::EndChild();
 
-    // Bottom bar: Export + Clear All (always visible)
+    // Bottom bar: Export + Merge + Clear All (always visible)
     ImGui::Separator();
     bool hasMarks = m_segments.GetTotalCount() > 0;
     bool canExport = hasMarks && !m_exporter.IsRunning();
+    // Merging needs at least two segments (frames can't be merged) and a source
+    // that can be stream-copied into an MP4 (so not a GIF).
+    bool canMerge = canExport && m_segments.GetCount() >= 2 && !IsGifSource();
+    const float barSpacing = ImGui::GetStyle().ItemSpacing.x;
+    const float barAvail = ImGui::GetContentRegionAvail().x - 2.0f * barSpacing;
     if (!canExport) ImGui::BeginDisabled();
-    float btnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
-    if (ImGui::Button("Export", ImVec2(btnWidth, 0))) {
+    if (ImGui::Button("Export", ImVec2(barAvail * 0.5f, 0))) {
         m_showExportDialog = true;
         auto stem = std::filesystem::path(m_currentFilePath).stem().string();
         InitExportDir();
         snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
         m_pendingExport = ExportSettings{};
+        m_exportMerged = false;
     }
     if (!canExport) ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!canMerge) ImGui::BeginDisabled();
+    if (ImGui::Button("##merge_btn", ImVec2(barAvail * 0.2f, 0))) {
+        m_showExportDialog = true;
+        auto stem = std::filesystem::path(m_currentFilePath).stem().string();
+        InitExportDir();
+        snprintf(m_exportName, sizeof(m_exportName), "%s_segments", stem.c_str());
+        m_pendingExport = ExportSettings{};
+        m_exportMerged = true;
+        m_exportMergedKeepAudio = true;
+    }
+    if (canMerge) TooltipFor("Export all segments merged into one video");
+    {
+        // Label: "1" and a down arrow, drawn by hand (the UI font has no arrow glyph).
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 bmin = ImGui::GetItemRectMin(), bmax = ImGui::GetItemRectMax();
+        const ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);  // dimmed while disabled
+        const float bh = bmax.y - bmin.y;
+        const float textW = ImGui::CalcTextSize("1").x;
+        const float gap = bh * 0.2f, arrowW = bh * 0.45f;
+        float x = (bmin.x + bmax.x) * 0.5f - (textW + gap + arrowW) * 0.5f;
+        dl->AddText(ImVec2(x, bmin.y + (bh - ImGui::GetTextLineHeight()) * 0.5f), col, "1");
+        x += textW + gap;
+        const float cx = x + arrowW * 0.5f;
+        const float top = bmin.y + bh * 0.25f, tip = bmax.y - bh * 0.25f;
+        dl->AddLine(ImVec2(cx, top), ImVec2(cx, tip), col, std::max(1.0f, bh * 0.07f));
+        dl->AddTriangleFilled(ImVec2(cx - arrowW * 0.5f, tip - arrowW * 0.5f),
+                              ImVec2(cx + arrowW * 0.5f, tip - arrowW * 0.5f),
+                              ImVec2(cx, tip), col);
+    }
+    if (!canMerge) ImGui::EndDisabled();
     ImGui::SameLine();
     if (!hasMarks) ImGui::BeginDisabled();
     if (ImGui::Button("Clear All", ImVec2(-1, 0))) {
@@ -3743,6 +3780,7 @@ void App::Render() {
             InitExportDir();
             snprintf(m_exportName, sizeof(m_exportName), "%s", stem.c_str());
             m_pendingExport = ExportSettings{};
+            m_exportMerged = false;
         }
     }
 
@@ -3750,11 +3788,14 @@ void App::Render() {
         m_exporter.ResetProgress();
         m_exportChecked.assign(m_segments.GetCount(), true);
         m_frameExportChecked.assign(m_segments.GetFrameCount(), true);
-        ImGui::OpenPopup("Export");
+        ImGui::OpenPopup("###Export");
         m_showExportDialog = false;
     }
 
-    bool popupVisibleThisFrame = ImGui::BeginPopupModal("Export", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    // "###Export" keeps one popup ID while the visible title depends on the mode.
+    bool popupVisibleThisFrame = ImGui::BeginPopupModal(
+        m_exportMerged ? "Export merged video###Export" : "Export###Export",
+        nullptr, ImGuiWindowFlags_AlwaysAutoResize);
     // Capture the prior-frame state before updating: the in-modal Cmd+E
     // close handler must NOT consume the same Cmd+E that just opened the
     // modal this frame, otherwise the modal opens and immediately closes.
@@ -3854,30 +3895,41 @@ void App::Render() {
             }
             if (!dirExists) ImGui::EndDisabled();
 
-            // Delimiter column matches the Browse+Open block above it, so the
-            // name input lines up with the dir input and both rows end flush.
-            float delimW = browseW + openW + dirSpacing;
-            // The use-base-name checkbox leads the input row.
-            float rowX = ImGui::GetCursorPosX();
-            float chkW = ImGui::GetFrameHeight() + dirSpacing;
-            ImGui::Text("Filename Base:");
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(rowX + dialogWidth - delimW);
-            ImGui::Text("Delimiter:");
-            TooltipFor("Text inserted between the base filename and each mark name");
-            ImGui::Checkbox("##use_base_name", &m_exportUseBaseName);
-            ImGui::SameLine();
-            if (!m_exportUseBaseName) ImGui::BeginDisabled();
-            ImGui::SetNextItemWidth(dialogWidth - delimW - dirSpacing - chkW);
-            ImGui::InputText("##name", m_exportName, sizeof(m_exportName));
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(delimW);
-            ImGui::InputText("##delim", m_exportDelimiter, sizeof(m_exportDelimiter));
-            if (!m_exportUseBaseName) ImGui::EndDisabled();
+            if (m_exportMerged) {
+                // One output file: the field holds the complete name; the
+                // extension is fixed. No delimiter / base-name options.
+                ImGui::Text("Filename:");
+                const float extW = ImGui::CalcTextSize(".mp4").x + dirSpacing;
+                ImGui::SetNextItemWidth(dialogWidth - extW);
+                ImGui::InputText("##name", m_exportName, sizeof(m_exportName));
+                ImGui::SameLine();
+                ImGui::TextUnformatted(".mp4");
+            } else {
+                // Delimiter column matches the Browse+Open block above it, so the
+                // name input lines up with the dir input and both rows end flush.
+                float delimW = browseW + openW + dirSpacing;
+                // The use-base-name checkbox leads the input row.
+                float rowX = ImGui::GetCursorPosX();
+                float chkW = ImGui::GetFrameHeight() + dirSpacing;
+                ImGui::Text("Filename Base:");
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(rowX + dialogWidth - delimW);
+                ImGui::Text("Delimiter:");
+                TooltipFor("Text inserted between the base filename and each mark name");
+                ImGui::Checkbox("##use_base_name", &m_exportUseBaseName);
+                ImGui::SameLine();
+                if (!m_exportUseBaseName) ImGui::BeginDisabled();
+                ImGui::SetNextItemWidth(dialogWidth - delimW - dirSpacing - chkW);
+                ImGui::InputText("##name", m_exportName, sizeof(m_exportName));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(delimW);
+                ImGui::InputText("##delim", m_exportDelimiter, sizeof(m_exportDelimiter));
+                if (!m_exportUseBaseName) ImGui::EndDisabled();
+            }
 
             // Mark list with checkboxes in scrollable table
             ImGui::Spacing();
-            ImGui::Text("Marks to export:");
+            ImGui::Text(m_exportMerged ? "Segments to merge, in this order:" : "Marks to export:");
             float rowH = ImGui::GetTextLineHeightWithSpacing() + 4;
             ImGuiTableFlags tableFlags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH;
             ImVec2 tableSize(0, 0);
@@ -3886,17 +3938,22 @@ void App::Render() {
                 tableSize.y = 10 * rowH + 30;
             }
             if (ImGui::BeginTable("##export_marks", 7, tableFlags, tableSize)) {
+                // Merged mode: one MP4 of segments only, so the per-mark Type /
+                // Format / Audio columns are hidden (audio is a single toggle below).
+                const ImGuiTableColumnFlags hideMerged =
+                    m_exportMerged ? ImGuiTableColumnFlags_Disabled : ImGuiTableColumnFlags_None;
                 ImGui::TableSetupColumn("##chk_col", ImGuiTableColumnFlags_WidthFixed, 24);
-                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 65);
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed | hideMerged, 65);
                 ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Fmt", ImGuiTableColumnFlags_WidthFixed, 45);
+                ImGui::TableSetupColumn("Fmt", ImGuiTableColumnFlags_WidthFixed | hideMerged, 45);
                 ImGui::TableSetupColumn("Speed", ImGuiTableColumnFlags_WidthFixed, 50);
                 ImGui::TableSetupColumn("Duration", ImGuiTableColumnFlags_WidthFixed, 70);
-                ImGui::TableSetupColumn("Audio", ImGuiTableColumnFlags_WidthFixed, 80);
+                ImGui::TableSetupColumn("Audio", ImGuiTableColumnFlags_WidthFixed | hideMerged, 80);
                 ImGui::TableHeadersRow();
 
                 for (size_t r = 0; r < rows.size(); r++) {
                     const Row& row = rows[r];
+                    if (m_exportMerged && row.isFrame) continue;  // frames aren't merged
                     uint64_t stableId = row.isFrame ? frames[row.index].addSeq : segs[row.index].addSeq;
                     ImGui::PushID(static_cast<int>(stableId));
                     ImGui::TableNextRow();
@@ -4003,7 +4060,7 @@ void App::Render() {
             // GIF sources — output matches source W/FPS, the width/fps inputs
             // would have no effect.
             bool hasGif = false;
-            if (!IsGifSource()) {
+            if (!IsGifSource() && !m_exportMerged) {
                 for (const auto& s : segs)
                     if (s.mode == ExportMode::GIF) { hasGif = true; break; }
             }
@@ -4020,7 +4077,38 @@ void App::Render() {
 
             // Output file preview
             ImGui::Spacing();
-            if (ImGui::CollapsingHeader("Files to be exported", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (m_exportMerged) {
+                // Summary instead of the per-file preview: one output file.
+                int nChosen = 0;
+                double totalSec = 0.0;
+                std::vector<TimeRange> chosen;
+                for (const Row& row : rows) {
+                    if (row.isFrame || !isChecked(row)) continue;
+                    const TimeRange& cs = segs[row.index];
+                    nChosen++;
+                    totalSec += (cs.endSec - cs.startSec) / (cs.speed > 0.0 ? cs.speed : 1.0);
+                    chosen.push_back(cs);
+                }
+                const bool audioDropped = MergedAudioForciblyDropped(chosen);
+                const bool srcNoAudio = !m_player.HasAudio();
+                ImGui::Text("%d segment%s, %.1fs total", nChosen, nChosen == 1 ? "" : "s", totalSec);
+                const bool audioLocked = audioDropped || srcNoAudio;
+                bool keepAudio = m_exportMergedKeepAudio && !audioLocked;
+                if (audioLocked) ImGui::BeginDisabled();
+                if (ImGui::Checkbox("Keep audio", &keepAudio)) m_exportMergedKeepAudio = keepAudio;
+                if (audioLocked) ImGui::EndDisabled();
+                if (audioDropped) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(dropped: a segment has a non-1x speed)");
+                } else if (srcNoAudio) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(the video has no audio)");
+                }
+                const std::string mergedName = std::string(m_exportName) + ".mp4";
+                if (m_exportName[0] != '\0' &&
+                    std::filesystem::exists(std::filesystem::path(m_exportDir) / mergedName))
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s  (already exists)", mergedName.c_str());
+            } else if (ImGui::CollapsingHeader("Files to be exported", ImGuiTreeNodeFlags_DefaultOpen)) {
                 std::string prefix = m_exportUseBaseName
                     ? std::string(m_exportName) + m_exportDelimiter : std::string();
                 ImGui::BeginChild("##export_preview", ImVec2(0, 80.0f * m_ui.GetUiScale()),
@@ -4048,7 +4136,7 @@ void App::Render() {
 
             // HDR sources are tone-mapped to SDR when re-encoded (GIF/PNG). Show
             // which operator will be used so exports match what's on screen.
-            if (m_videoColorMode != VideoColorMode::SDR) {
+            if (!m_exportMerged && m_videoColorMode != VideoColorMode::SDR) {
                 ImGui::Spacing();
                 const ImVec4 accent(0.35f, 0.70f, 1.0f, 1.0f); // info blue
                 ImGui::PushStyleColor(ImGuiCol_Border, accent);
@@ -4085,8 +4173,10 @@ void App::Render() {
             bool hasEmptyName = false;
             for (const Row& row : rows) {
                 if (!isChecked(row)) continue;
+                if (m_exportMerged && row.isFrame) continue;
                 anyChecked = true;
-                if (nameForRow(row).empty()) hasEmptyName = true;
+                // Merged: mark names don't end up in any file name.
+                if (!m_exportMerged && nameForRow(row).empty()) hasEmptyName = true;
             }
             if (hasEmptyName)
                 ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "All marks must have a name.");
@@ -4097,12 +4187,17 @@ void App::Render() {
                 m_pendingExport.tonemapper = m_tonemapper;
                 m_pendingExport.delimiter = m_exportDelimiter;
                 m_pendingExport.useBaseName = m_exportUseBaseName;
+                m_pendingExport.mergeSegments = m_exportMerged;
+                m_pendingExport.mergedKeepAudio = m_exportMergedKeepAudio;
                 m_pendingExport.segments.clear();
                 m_pendingExport.frames.clear();
                 for (const Row& row : rows) {
                     if (!isChecked(row)) continue;
-                    if (row.isFrame) m_pendingExport.frames.push_back(frames[row.index]);
-                    else             m_pendingExport.segments.push_back(segs[row.index]);
+                    if (row.isFrame) {
+                        if (!m_exportMerged) m_pendingExport.frames.push_back(frames[row.index]);
+                    } else {
+                        m_pendingExport.segments.push_back(segs[row.index]);
+                    }
                 }
                 m_pendingExport.outputPath = (std::filesystem::path(m_exportDir) / m_exportName).string();
 
@@ -4114,16 +4209,23 @@ void App::Render() {
                     ? base.filename().string() + m_pendingExport.delimiter : std::string();
                 std::string dir = base.parent_path().string();
                 m_conflictingFiles.clear();
-                for (const auto& seg : m_pendingExport.segments) {
-                    std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
-                    std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + seg.name + ext);
+                if (m_exportMerged) {
+                    // One output file; the exporter appends ".mp4".
+                    std::filesystem::path outPath = std::filesystem::path(dir) / (base.filename().string() + ".mp4");
                     if (std::filesystem::exists(outPath))
                         m_conflictingFiles.push_back(outPath.filename().string());
-                }
-                for (const auto& fm : m_pendingExport.frames) {
-                    std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + fm.name + ".png");
-                    if (std::filesystem::exists(outPath))
-                        m_conflictingFiles.push_back(outPath.filename().string());
+                } else {
+                    for (const auto& seg : m_pendingExport.segments) {
+                        std::string ext = (seg.mode == ExportMode::GIF) ? ".gif" : inputExt;
+                        std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + seg.name + ext);
+                        if (std::filesystem::exists(outPath))
+                            m_conflictingFiles.push_back(outPath.filename().string());
+                    }
+                    for (const auto& fm : m_pendingExport.frames) {
+                        std::filesystem::path outPath = std::filesystem::path(dir) / (prefix + fm.name + ".png");
+                        if (std::filesystem::exists(outPath))
+                            m_conflictingFiles.push_back(outPath.filename().string());
+                    }
                 }
                 if (m_conflictingFiles.empty())
                     m_exporter.Start(m_currentFilePath, m_pendingExport);
@@ -4131,10 +4233,11 @@ void App::Render() {
                     m_showOverwriteConfirm = true;
             };
 
-            bool canExport = anyChecked && !hasEmptyName;
+            bool canExport = anyChecked && !hasEmptyName &&
+                             (!m_exportMerged || m_exportName[0] != '\0');
             if (!canExport) ImGui::BeginDisabled();
             float expBtnWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.7f;
-            if (ImGui::Button("Export", ImVec2(expBtnWidth, 0))) triggerExport();
+            if (ImGui::Button(m_exportMerged ? "Export merged video" : "Export", ImVec2(expBtnWidth, 0))) triggerExport();
             if (!canExport) ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Cancel", ImVec2(-1, 0))) {
@@ -4178,7 +4281,10 @@ void App::Render() {
             // --- Progress display ---
             int cur = progress.currentItem;
             int total = progress.totalItems;
-            ImGui::Text("Exporting %d of %d...", cur, total);
+            if (m_exportMerged)
+                ImGui::Text("Merging segment %d of %d...", std::max(cur, 1), total);
+            else
+                ImGui::Text("Exporting %d of %d...", cur, total);
             ImGui::ProgressBar(progress.fraction, ImVec2(400, 0));
 
             if (ImGui::Button("Cancel Export", ImVec2(120, 0))) {
@@ -4250,7 +4356,11 @@ void App::Render() {
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
-            if (ImGui::Button("Skip Existing", ImVec2(btnW, 0))) {
+            // Merged export has a single output file: nothing to skip.
+            if (m_exportMerged) ImGui::BeginDisabled();
+            const bool skipExistingClicked = ImGui::Button("Skip Existing", ImVec2(btnW, 0));
+            if (m_exportMerged) ImGui::EndDisabled();
+            if (skipExistingClicked) {
                 std::filesystem::path base(m_pendingExport.outputPath);
                 std::string prefix = m_pendingExport.useBaseName
                     ? base.filename().string() + m_pendingExport.delimiter : std::string();

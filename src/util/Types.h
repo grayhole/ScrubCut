@@ -125,4 +125,20 @@ struct ExportSettings {
     // HDR->SDR operator used when re-encoding HDR sources (GIF/PNG). Mirrors the
     // user's current display selection so exports match what's on screen.
     Tonemapper tonemapper = Tonemapper::Uncharted2;
+    // Merged export: stream-copy all `segments`, in list order, into ONE MP4
+    // (outputPath + ".mp4"; no delimiter / per-mark names). Per-segment mode,
+    // format and audio choices are ignored; `frames` are not part of a merge.
+    bool mergeSegments = false;
+    // Keep the source audio in the merged file. The effective decision also
+    // depends on the segments' speeds (see MergedAudioForciblyDropped).
+    bool mergedKeepAudio = true;
 };
+
+// True if any segment runs at a non-1x speed: a merged file has a single audio
+// timeline, and scaled stream-copy audio can't be produced cleanly, so audio is
+// dropped for the whole file. The merge dialog greys out its Audio toggle on this.
+inline bool MergedAudioForciblyDropped(const std::vector<TimeRange>& segments) {
+    for (const TimeRange& s : segments)
+        if (s.speed < 0.9999 || s.speed > 1.0001) return true;
+    return false;
+}
