@@ -89,6 +89,13 @@ static int RunExportFrame(int argc, char* argv[]) {
 }
 
 int main(int argc, char* argv[]) {
+
+    SDL_SetAppMetadata(
+        "ScrubCut",
+        "1.0",
+        "org.scrubcut.ScrubCut"
+    );
+
     // Arm the Tracy profiler before anything else runs so a waiting viewer
     // (tracy-profiler -a 127.0.0.1) can catch the startup flow. The on-demand
     // handshake still races the first ~100 ms; -profile-wait closes that by
